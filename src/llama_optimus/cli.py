@@ -4,7 +4,7 @@
 import argparse, os, sys
 import platform 
 from pathlib import Path   
-from .core import run_optimization, estimate_max_ngl, warmup_until_stable
+from .core import run_optimization, estimate_max_ngl, warmup_until_stable, estimate_ctx_bounds, run_ctx_scan
 from .override_patterns import OVERRIDE_PATTERNS   
 from .search_space import SEARCH_SPACE, max_threads 
 
@@ -68,6 +68,24 @@ def build_parser():
     parser.add_argument("-ctv", "--cache-type-v", type=str, default=None, dest="cache_type_v",
         help="Cache type for V (e.g. f16, q8_0, q4_0). Passed directly to llama-bench -ctv.")
 
+    # Context scan options
+    ctx_group = parser.add_argument_group("context scan")
+    ctx_group.add_argument(
+        "--ctx-scan", action="store_true", default=False,
+        help="Run a context-length scan (find max -c before OOM per KV type) "
+             "instead of the Optuna optimization flow.")
+    ctx_group.add_argument(
+        "--ctx-min", type=int, default=512, dest="ctx_min",
+        help="Minimum context size to probe in --ctx-scan (default: 512).")
+    ctx_group.add_argument(
+        "--ctx-max", type=int, default=None, dest="ctx_max",
+        help="Maximum context size to probe in --ctx-scan. "
+             "When absent, estimated automatically from model file size and available memory.")
+    ctx_group.add_argument(
+        "--ctx-scan-types", type=str, default=None, dest="ctx_scan_types",
+        help="Comma-separated KV cache types to compare in --ctx-scan "
+             "(e.g. f16,q8_0,q4_0). When absent, uses --cache-type-k/v.")
+
     return parser
 
 
@@ -123,6 +141,13 @@ def main():
     ctv_display = args.cache_type_v if args.cache_type_v else "llama-bench default (f16)"
     print(f"Cache type K (-ctk): {ctk_display}")
     print(f"Cache type V (-ctv): {ctv_display}")
+    if args.ctx_scan:
+        ctx_max_display = str(args.ctx_max) if args.ctx_max is not None else "auto (estimated from model + memory)"
+        print(f"Context scan:  enabled")
+        print(f"  ctx-min:     {args.ctx_min}")
+        print(f"  ctx-max:     {ctx_max_display}")
+        scan_types_display = args.ctx_scan_types if args.ctx_scan_types else f"{ctk_display}, {ctv_display}"
+        print(f"  scan types:  {scan_types_display}")
     print("")
 
     # default: estimate maximum number of layers before run_optimization 
@@ -146,6 +171,46 @@ def main():
         print("")
         print(f"Setting maximum -ngl to {SEARCH_SPACE['gpu_layers']['high']}")
         print("")
+
+    # context-length scan flow (replaces optimization when --ctx-scan is set)
+    if args.ctx_scan:
+        # Parse KV type pairs from --ctx-scan-types, or fall back to single ctk/ctv pair
+        if args.ctx_scan_types:
+            types = [t.strip() for t in args.ctx_scan_types.split(",")]
+            kv_pairs = [
+                (None if t == "f16" else t, None if t == "f16" else t)
+                for t in types
+            ]
+        else:
+            kv_pairs = [(args.cache_type_k, args.cache_type_v)]
+
+        # Determine ctx_max: user-supplied or auto-estimated
+        ctx_max = args.ctx_max
+        if ctx_max is None:
+            primary_ctk, primary_ctv = kv_pairs[0]
+            _, ctx_max = estimate_ctx_bounds(
+                model_path=model_path,
+                cache_type_k=primary_ctk,
+                cache_type_v=primary_ctv,
+            )
+
+        ngl = SEARCH_SPACE['gpu_layers']['high']
+
+        print("")
+        print("########################################################")
+        print("# Starting context-length scan...                      #")
+        print("########################################################")
+        print("")
+
+        run_ctx_scan(
+            llama_bench_path=llama_bench_path,
+            model_path=model_path,
+            ngl=ngl,
+            min_ctx=args.ctx_min,
+            max_ctx=ctx_max,
+            kv_type_pairs=kv_pairs,
+        )
+        return  # skip warmup and optimization
 
     # system warm-up before optimization
     max_ngl_wup=SEARCH_SPACE['gpu_layers']['high']

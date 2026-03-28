@@ -58,6 +58,238 @@ def estimate_max_ngl(llama_bench_path, model_path, min_ngl=0, max_ngl=SEARCH_SPA
 
 
 
+# ── KV cache type bytes per element ──────────────────────────────────────────
+_KV_BYTES_PER_ELEM = {
+    None:      2.0,      # default (f16)
+    "f32":     4.0,
+    "f16":     2.0,
+    "bf16":    2.0,
+    "q8_0":    1.0625,
+    "q5_1":    0.750,
+    "q5_0":    0.6875,
+    "q4_1":    0.625,
+    "q4_0":    0.5625,
+    "iq4_nl":  0.5625,
+}
+
+
+def _get_available_memory_bytes():
+    """
+    Best-effort probe for available memory (GPU VRAM or system RAM).
+    No new dependencies — uses subprocess and /proc/meminfo / sysctl.
+    Returns bytes. Falls back to 8 GiB with a warning printed.
+    """
+    # 1. nvidia-smi (NVIDIA discrete GPU)
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        mib = int(result.stdout.strip().splitlines()[0])
+        return mib * 1024 * 1024
+    except Exception:
+        pass
+
+    # 2. /proc/meminfo (Linux RAM fallback)
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+
+    # 3. sysctl hw.memsize (macOS / Apple Silicon unified memory)
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        total = int(result.stdout.strip())
+        return total // 2  # conservative: assume ~50% available
+    except Exception:
+        pass
+
+    # 4. Hardcoded fallback
+    print("WARNING: could not detect available memory, using default ctx-max=131072")
+    return 8 * 1024 ** 3
+
+
+def estimate_ctx_bounds(model_path, cache_type_k=None, cache_type_v=None,
+                        ctx_step=512, fallback_max=131072):
+    """
+    Estimate (min_ctx, max_ctx) binary-search bounds from model file size
+    and available system memory. No new runtime dependencies required.
+
+    The returned max_ctx is intentionally a conservative overestimate of the
+    true maximum context so the binary search never caps below the real upper bound.
+
+    Parameters:
+        model_path (str): Path to the model file.
+        cache_type_k (str|None): KV cache type for K (e.g. "q8_0"). None = f16 default.
+        cache_type_v (str|None): KV cache type for V. None = f16 default.
+        ctx_step (int): Context size alignment step (default 512).
+        fallback_max (int): Fallback max_ctx if estimation fails (default 131072).
+
+    Returns:
+        tuple[int, int]: (min_ctx, max_ctx) both multiples of ctx_step.
+    """
+    try:
+        model_size = os.path.getsize(model_path)
+    except OSError:
+        return 512, fallback_max
+
+    available = _get_available_memory_bytes()
+    overhead = 600 * 1024 * 1024  # ~0.6 GiB CUDA/Metal runtime overhead
+    headroom = max(0, available - model_size - overhead)
+
+    # KV bytes/token heuristic: model_size / 8192 anchors at
+    # "KV ≈ model file size at 8K context" — slight overestimate for most
+    # models, making max_ctx a conservative (safe) lower bound.
+    kv_bytes_per_token_f16 = max(model_size / 8192, 32 * 1024)
+
+    k_bpe = _KV_BYTES_PER_ELEM.get(cache_type_k, 2.0)
+    v_bpe = _KV_BYTES_PER_ELEM.get(cache_type_v, 2.0)
+    multiplier = (k_bpe + v_bpe) / (2 * 2.0)  # relative to f16 baseline
+
+    kv_bytes_per_token = kv_bytes_per_token_f16 * multiplier
+    if kv_bytes_per_token <= 0 or headroom <= 0:
+        return 512, fallback_max
+
+    raw = headroom / kv_bytes_per_token
+    max_ctx = int(min(max(ctx_step, (raw // ctx_step) * ctx_step), 1_048_576))
+
+    ctk_display = cache_type_k or "f16"
+    ctv_display = cache_type_v or "f16"
+    print(
+        f"Estimated context search bounds: min=512, max={max_ctx}\n"
+        f"  (model size: {model_size / 1024**3:.1f} GiB, "
+        f"available memory: {available / 1024**3:.1f} GiB, "
+        f"KV type: {ctk_display}/{ctv_display})"
+    )
+    return 512, max_ctx
+
+
+def estimate_max_ctx(llama_bench_path, model_path, ngl,
+                     min_ctx=512, max_ctx=131072, ctx_step=512,
+                     cache_type_k=None, cache_type_v=None):
+    """
+    Estimate the maximum context length (-c) that runs without OOM for the
+    given model, ngl, and KV cache types. Uses a binary search with minimal
+    llama-bench probes (-n 1 -r 1). Mirrors estimate_max_ngl().
+
+    Parameters:
+        llama_bench_path (str): Path to llama-bench binary.
+        model_path (str): Path to model file.
+        ngl (int): Number of GPU layers to use during probes.
+        min_ctx (int): Minimum context size to probe.
+        max_ctx (int): Maximum context size to probe.
+        ctx_step (int): Alignment step for context sizes (default 512).
+        cache_type_k (str|None): KV cache type for K.
+        cache_type_v (str|None): KV cache type for V.
+
+    Returns:
+        int: Highest context size (multiple of ctx_step) that succeeded.
+    """
+    # Align bounds to ctx_step multiples
+    low  = (min_ctx // ctx_step) * ctx_step
+    high = (max_ctx // ctx_step) * ctx_step
+
+    if low >= high:
+        return low
+
+    print(f"Estimating max context (binary search: {low}–{high}, step={ctx_step})...")
+
+    while low < high:
+        mid = ((low + high + ctx_step) // (2 * ctx_step)) * ctx_step  # upper-biased, aligned
+
+        cmd = [
+            llama_bench_path,
+            "--model", model_path,
+            "-ngl",   str(ngl),
+            "-c",     str(mid),
+            "-n",     "1",
+            "-r",     "1",
+            "-o",     "csv",
+        ]
+        if cache_type_k:
+            cmd += ["-ctk", cache_type_k]
+        if cache_type_v:
+            cmd += ["-ctv", cache_type_v]
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=620, check=True)
+            print(f"  ctx={mid}: OK")
+            low = mid
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            print(f"  ctx={mid}: FAIL")
+            high = mid - ctx_step
+
+    if low == (min_ctx // ctx_step) * ctx_step:
+        print(f"WARNING: even minimum context ({low}) failed — "
+              "model may not fit at any context size with current settings.")
+    else:
+        print(f"Max context estimate: {low} tokens")
+
+    return low
+
+
+def _print_ctx_scan_table(results):
+    """Print a formatted comparison table of (ctk, ctv) -> max context tokens."""
+    header = f"{'KV Type (K / V)':<22} | {'Max Context (tokens)':>20} | {'Approx':>8}"
+    sep    = "-" * 22 + "-+-" + "-" * 20 + "-+-" + "-" * 8
+    print()
+    print("#" * 58)
+    print("# Context length scan results                         #")
+    print("#" * 58)
+    print()
+    print(f"  {header}")
+    print(f"  {sep}")
+    for (ctk, ctv), max_tokens in results.items():
+        label  = f"{ctk or 'f16':<6} / {ctv or 'f16':<6}"
+        tokens = f"{max_tokens:>20,}"
+        approx = f"{max_tokens // 1024} K" if max_tokens >= 1024 else str(max_tokens)
+        print(f"  {label:<22} | {tokens} | {approx:>8}")
+    print()
+
+
+def run_ctx_scan(llama_bench_path, model_path, ngl, min_ctx, max_ctx, kv_type_pairs):
+    """
+    Run estimate_max_ctx() for each (cache_type_k, cache_type_v) pair and
+    print a comparison table.
+
+    Parameters:
+        llama_bench_path (str): Path to llama-bench binary.
+        model_path (str): Path to model file.
+        ngl (int): GPU layers to use during probes.
+        min_ctx (int): Minimum context size bound.
+        max_ctx (int): Maximum context size bound.
+        kv_type_pairs (list[tuple]): List of (cache_type_k, cache_type_v) pairs.
+
+    Returns:
+        dict: Mapping of (ctk, ctv) -> max_ctx_tokens.
+    """
+    results = {}
+
+    for ctk, ctv in kv_type_pairs:
+        ctk_display = ctk or "f16"
+        ctv_display = ctv or "f16"
+        print()
+        print(f"Scanning max context for KV type: ctk={ctk_display}, ctv={ctv_display}")
+        results[(ctk, ctv)] = estimate_max_ctx(
+            llama_bench_path=llama_bench_path,
+            model_path=model_path,
+            ngl=ngl,
+            min_ctx=min_ctx,
+            max_ctx=max_ctx,
+            cache_type_k=ctk,
+            cache_type_v=ctv,
+        )
+
+    _print_ctx_scan_table(results)
+    return results
+
+
 def run_llama_bench_with_csv(cmd, metric):
     """
     Run llama-bench using the specified command, saving the output as a temporary CSV,

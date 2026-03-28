@@ -9,6 +9,12 @@ legacy_files/
 assets/logo_files
 temp/
 
+# agent/tool directories and files (local only)
+.ralph/
+.serena/
+.agents/
+ralph.yml
+
 # macOS Finder metadata
 .DS_Store
 */.DS_Store

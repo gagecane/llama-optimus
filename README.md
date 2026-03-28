@@ -37,7 +37,7 @@ Brings Bayesian optimization (Optuna) to your local & embedded AI models.
 
 ## Requirements
 
-- Python 3.10+  
+- Python 3.8+  
 
 - **Latest** [llama.cpp](https://github.com/ggerganov/llama.cpp) (**release version > 3667** : which incorporated --no-warmup flag to llama-bench : b5706) 
 
@@ -179,16 +179,16 @@ llama-optimus --trials 25 -r 3 --metric tg
 
 * `--model`      Path to your `.gguf` model file (or set `$MODEL_PATH`)
 
-* `--trials`   Number of optimization trials (default: 35)
+* `--trials`   Number of optimization trials (default: 45)
 
 * `--metric`   Which throughput metric to optimize:
   `tg` = token generation speed,
   `pp` = prompt processing speed,
   `mean` = average of both
 
-* `-r` / `--repeat` How many repetitions per configuration (default: 2; use 1 for quick/dirty, 5 for robust)
+* `-r` / `--repeat` How many repetitions per configuration (default: 3; use 1 for quick/dirty, 5 for robust)
 
-* `--n-tokens`  Number of tokens to use for benchmarking. Larger = more stable measurements (default: 60).
+* `--n-tokens`  Number of tokens to use for benchmarking. Larger = more stable measurements (default: 192).
 
 * `--override-mode`  How to treat --override-tensor (default: scan):
     `none`: ignore this flag (do not scan over override-tensor space)
@@ -197,7 +197,7 @@ llama-optimus --trials 25 -r 3 --metric tg
 
 * `--n-warmup-tokens` Number of tokens passed to llama-bench during each warmup loop
 
-* `--warmup-runs`  Max warm-up iterations before optimisation (default: 30; minimum is 4; For no warmup, use the `--no-warmup` flag )
+* `--warmup-runs`  Max warm-up iterations before optimisation (default: 35; minimum is 4; For no warmup, use the `--no-warmup` flag )
 
 * `--no-warmup` Skip warmup phase (for test/debug purpose)
 
@@ -276,7 +276,7 @@ llama-optimus --n-tokens 256
 ```
 
 Later, for a stable final score, re-run llama-bench with the best flags found (don't forget to warm-up first):
-```bas'
+```bash
 llama-bench ... -p 512 -n 256 -r 5 --progress
 ```
 
@@ -300,7 +300,7 @@ For this reason, llama-optimus warms-up before scanning the parameter space with
 **Keep in mind**: never trust cold-start numbers. 
 Warming up the system and waiting for stable, “saturated” (real-world) performance will make your optimizer results much more robust and grounded to real use cases.
 
-Make sure your fans turn on with the default number of warmup runs (default: 40). 
+Make sure your fans turn on with the default number of warmup runs (default: 35). 
 
 If you need more (or less) runs to warmup your system, consider passing --n-warmup-runs flag during llama-optimus launch:
 

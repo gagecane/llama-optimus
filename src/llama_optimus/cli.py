@@ -11,16 +11,16 @@ from .search_space import SEARCH_SPACE, max_threads
 from llama_optimus import __version__
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description="llama-optimus: Benchmark & tune llama.cpp.",
         epilog="""
         Example usage:
 
             llama-optimus --llama-bin my_path_to/llama.cpp/build/bin --model my_path_to/models/my-model.gguf --trials 35 --metric tg
-            
+
         for a quick test (set a single Optuna trial and a single repetition of llama-bench):
-            
+
             llama-optimus --llama-bin my_path_to/llama.cpp/build/bin --model my_path_to/models/my-model.gguf --trials 1 -r 1 --metric tg
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -43,12 +43,12 @@ def main():
         "If n_tokens is too low, uncertainty takes over, optimization may suffer. Still, if you need to lower it, " \
         "try to operate with n_tokens > 70 and --repeat 3. " \
         "For fast exploration/testing/debug: --n-tokens 10 --repeat 2 is fine")
-    
+
     parser.add_argument("--n-warmup-tokens", "-nwt", type=int, default=128, help="Number of tokens passed to " \
         "llama-bench during each warmup loop. In case of large models (and you getting small tg tokens/s), "
         "if n_warmup_tokens is too large, it can happen that you warmup in the first warmup cycle, and you end " \
         "up not detecting the warmup. ")
-    
+
     parser.add_argument("--n-warmup-runs", type=int, default=35, help="Maximum warm-up iterations before trials " \
     "begin. To skip warm-up completely, use the --no-warmup flag; Otherwise, there will be a minimum " \
     "number of warmup runs, which is set with `min_runs=3` in core function definition")
@@ -62,7 +62,17 @@ def main():
     parser.add_argument("--override-mode", type=str, default="scan", choices=["none", "scan", "custom"],
     help=f"'none': do not scan this parameter; scan: 'scan' over preset override-tensor patterns; " \
     f"'custom': (future) user provides their own pattern(s). Available override patterns: {OVERRIDE_PATTERNS.keys()}" )
-    
+
+    parser.add_argument("-ctk", "--cache-type-k", type=str, default=None, dest="cache_type_k",
+        help="Cache type for K (e.g. f16, q8_0, q4_0). Passed directly to llama-bench -ctk.")
+    parser.add_argument("-ctv", "--cache-type-v", type=str, default=None, dest="cache_type_v",
+        help="Cache type for V (e.g. f16, q8_0, q4_0). Passed directly to llama-bench -ctv.")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     # Set paths based on CLI flags, env vars, or prompt user to provide it
@@ -109,6 +119,10 @@ def main():
     print(f"Number of CPUs: {max_threads}.")
     print(f"Path to 'llama-bench':{llama_bench_path}")  # in llama.cpp/tools/
     print(f"Path to 'model.gguf' file:{model_path}")
+    ctk_display = args.cache_type_k if args.cache_type_k else "llama-bench default (f16)"
+    ctv_display = args.cache_type_v if args.cache_type_v else "llama-bench default (f16)"
+    print(f"Cache type K (-ctk): {ctk_display}")
+    print(f"Cache type V (-ctv): {ctv_display}")
     print("")
 
     # default: estimate maximum number of layers before run_optimization 
@@ -126,8 +140,9 @@ def main():
         print("")
 
         SEARCH_SPACE['gpu_layers']['high'] = estimate_max_ngl(
-            llama_bench_path=llama_bench_path, model_path=model_path, 
-            min_ngl=0, max_ngl=SEARCH_SPACE['gpu_layers']['high'])
+            llama_bench_path=llama_bench_path, model_path=model_path,
+            min_ngl=0, max_ngl=SEARCH_SPACE['gpu_layers']['high'],
+            cache_type_k=args.cache_type_k, cache_type_v=args.cache_type_v)
         print("")
         print(f"Setting maximum -ngl to {SEARCH_SPACE['gpu_layers']['high']}")
         print("")
@@ -158,9 +173,10 @@ def main():
             print("")
 
         # launch warmup
-        warmup_until_stable(llama_bench_path=llama_bench_path, model_path=model_path, metric=args.metric, 
+        warmup_until_stable(llama_bench_path=llama_bench_path, model_path=model_path, metric=args.metric,
                             ngl=max_ngl_wup, min_runs=4, n_warmup_runs=args.n_warmup_runs,
-                            n_warmup_tokens=args.n_warmup_tokens, max_threads=max_threads)
+                            n_warmup_tokens=args.n_warmup_tokens, max_threads=max_threads,
+                            cache_type_k=args.cache_type_k, cache_type_v=args.cache_type_v)
 
     print("")
     print("##################################")
@@ -168,9 +184,10 @@ def main():
     print("##################################")
     print("")
 
-    run_optimization(n_trials=args.trials, n_tokens=args.n_tokens, metric=args.metric, 
-                     repeat=args.repeat, llama_bench_path=llama_bench_path, 
-                     model_path=model_path, llama_bin_path=llama_bin_path, override_mode=args.override_mode)  
+    run_optimization(n_trials=args.trials, n_tokens=args.n_tokens, metric=args.metric,
+                     repeat=args.repeat, llama_bench_path=llama_bench_path,
+                     model_path=model_path, llama_bin_path=llama_bin_path, override_mode=args.override_mode,
+                     cache_type_k=args.cache_type_k, cache_type_v=args.cache_type_v)
 
 if __name__ == "__main__":
 
